@@ -1,0 +1,1075 @@
+package com.baosight.bsfc4.nb.aq.service;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.math.BigDecimal;
+import java.text.DecimalFormat;
+import java.text.MessageFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.GregorianCalendar;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.math.RandomUtils;
+
+import com.baosight.bsfc4.nb.aq.domain.AccBalance;
+import com.baosight.bsfc4.nb.aq.domain.AvaAccount;
+import com.baosight.bsfc4.nb.np.domain.PopupInfo;
+import com.baosight.bsfc4.nb.service.ServiceNBBase;
+import com.baosight.bsfc4.util.DateUtils;
+import com.baosight.bsfc4.util.UserUtil;
+import com.baosight.bsfc4.ze.qr.utils.PropertiesUtils;
+import com.baosight.ebanc.bean.Account;
+import com.baosight.ebanc.bean.Balance;
+import com.baosight.ebanc.bean.BalanceResult;
+import com.baosight.ebanc.bean.Result;
+import com.baosight.ebanc.client.EBancClient;
+import com.baosight.iplat4j.core.ei.EiBlock;
+import com.baosight.iplat4j.core.ei.EiBlockMeta;
+import com.baosight.iplat4j.core.ei.EiColumn;
+import com.baosight.iplat4j.core.ei.EiConstant;
+import com.baosight.iplat4j.core.ei.EiInfo;
+import com.baosight.iplat4j.core.exception.PlatException;
+import com.baosight.iplat4j.core.resource.I18nMessages;
+import com.baosight.iplat4j.logging.Logger;
+import com.baosight.iplat4j.logging.LoggerFactory;
+import com.baosight.iplat4j.util.util.DateUtil;
+
+import jxl.Workbook;
+import jxl.format.UnderlineStyle;
+import jxl.read.biff.BiffException;
+import jxl.write.Label;
+import jxl.write.NumberFormat;
+import jxl.write.WritableCellFormat;
+import jxl.write.WritableFont;
+import jxl.write.WritableSheet;
+import jxl.write.WritableWorkbook;
+import jxl.write.WriteException;
+import jxl.write.biff.RowsExceededException;
+
+/**
+ * 账户余额查询
+ *
+ * @author 陈程
+ * @version 4.0
+ * @date 2012-08-15
+ */
+public class ServiceNBAQ0101 extends ServiceNBBase {
+    private static Logger logger = LoggerFactory.getLogger(ServiceNBAQ0101.class);
+    private static Map<String, String> map = PropertiesUtils.load("ebanc2cLocal.properties");
+    private static String hostZh = map.get("HostZhwh");
+    private static String portZh = map.get("PortZhwh");
+    private static String bakSwiftZh = map.get("BNKSwiftZhwh");
+
+    public EiInfo initLoad(EiInfo inInfo) {
+        inInfo.setMsg("欢迎使用!");
+        EiInfo outInfo = super.initLoad(inInfo);
+        initSysCode(outInfo);
+        initDate(outInfo);
+        return outInfo;
+    }
+
+    private void initDate(EiInfo inInfo) {
+        Calendar cal = Calendar.getInstance();
+        cal.add(GregorianCalendar.DAY_OF_YEAR, -1);
+        String yesterday = DateUtils.format(cal.getTime());
+        inInfo.set("inqu_history-0-beginDate", yesterday);
+        inInfo.set("inqu_history-0-endDate", yesterday);
+    }
+
+    private void initSysCode(EiInfo outInfo) {
+        //initSysCode("NB02", outInfo);
+        initSysCode("NB13", outInfo);
+        initSysCode("CP02", outInfo);
+        initDynSysCode("BFSM.T_SM_BANKNO", "LENGTH(BANK_BELONG) = '2' ORDER BY BANK_BELONG",
+                "BANKNAME", "BANK_BELONG", outInfo);
+        initCurrency(outInfo);
+    }
+
+    /**
+     * 获取币种小代码
+     *
+     * @param outInfo
+     */
+    private void initCurrency(EiInfo outInfo) {
+        EiBlock eiBlock = initSysCode("NBAQ0101.currencyCodeList", null, "cryCd");
+        outInfo.addBlock(eiBlock);
+    }
+
+    /**
+     * 按银行对账户分组
+     *
+     * @param outer
+     * @return
+     */
+    private Map<String, List<AvaAccount>> groupByBank(List<AvaAccount> outer) {
+        Map<String, List<AvaAccount>> groups = new HashMap<String, List<AvaAccount>>(8);
+        String bankNo = StringUtils.EMPTY;
+        List<AvaAccount> accounts = null;
+        for (AvaAccount account : outer) {
+            bankNo = account.getBankNo();
+            if (StringUtils.isBlank(bankNo)) {
+                throw new PlatException(MessageFormat
+                        .format("账号[{0}]未配置银行代码!", account.getAccNo()));
+            }
+            if (groups.containsKey(bankNo)) {
+                groups.get(bankNo).add(account);
+            } else {
+                accounts = new ArrayList<AvaAccount>(10);
+                accounts.add(account);
+                groups.put(bankNo, accounts);
+            }
+        }
+        return groups;
+    }
+
+    /**
+     * 构建直联账户
+     *
+     * @param avaAccounts
+     * @return
+     */
+    private List<Account> buildDirectAccount(List<AvaAccount> avaAccounts) {
+        List<Account> accounts = new ArrayList<Account>(20);
+        Account account = null;
+        for (AvaAccount ava : avaAccounts) {
+            account = new Account(bakSwiftZh, ava.getAccNo(), ava.getCurrency());
+            account.setCnapsNo(ava.getCnapsNo());
+            account.setUnionNo(ava.getUnionNo());
+            account.setReserved4(ava.getIsoCurrency());
+            accounts.add(account);
+        }
+        return accounts;
+    }
+
+    private void setDirectMsg(List<AccBalance> balances,
+                              List<AvaAccount> avaAccounts, String directMsg) {
+        AccBalance blanc = null;
+        for (AvaAccount ava : avaAccounts) {
+            blanc = new AccBalance();
+            blanc.setAccNo(ava.getAccNo());
+            blanc.setAccName(ava.getAccName());
+            blanc.setAccType(ava.getAccType());
+            blanc.setCurrency(ava.getCurrency());
+            blanc.setCurrencyName(ava.getCurrencyName());
+            blanc.setGroupCode(ava.getGroupCode());
+            blanc.setGroupName(ava.getGroupName());
+            blanc.setInOutType(ava.getInOutType());
+            blanc.setBankName(ava.getBankName());
+            blanc.setBalance(null);
+            blanc.setDirectMsg(directMsg);
+            balances.add(blanc);
+        }
+    }
+
+    private void setDirectBalance(List<AccBalance> accBalances,
+                                  List<Balance> balances, AvaAccount ava) {
+        String bal = StringUtils.EMPTY;
+        BigDecimal dcmbal = null;
+        AccBalance blanc = null;
+
+        //根据ID排序
+        Collections.sort(balances, new Comparator<Balance>() {
+            /*
+             * int compare(Student o1, Student o2) 返回一个基本类型的整型，
+             * 返回负数表示：o1 小于o2，
+             * 返回0 表示：o1和o2相等，
+             * 返回正数表示：o1大于o2。
+             */
+            public int compare(Balance o1, Balance o2) {
+                String idStr1 = o1.getBalanceDate();
+                String idStr2 = o2.getBalanceDate();
+
+                if (StringUtils.isNotBlank(idStr1)) {
+                    idStr1 = idStr1.replace("-", "");
+                } else {
+                    idStr1 = "0";
+                }
+
+                if (StringUtils.isNotBlank(idStr2)) {
+                    idStr2 = idStr2.replace("-", "");
+                } else {
+                    idStr2 = "0";
+                }
+
+                int id1 = Integer.parseInt(idStr1);
+                int id2 = Integer.parseInt(idStr2);
+
+                //进行升序排列  
+                if (id1 > id2) {
+                    return 1;
+                }
+                if (id1 == id2) {
+                    return 0;
+                }
+                return -1;
+            }
+        });
+
+        for (Balance b : balances) {
+            if (ava.getAccNo().equals(b.getAccountNo())) {
+                blanc = new AccBalance();
+                blanc.setAccNo(ava.getAccNo());
+                blanc.setAccName(ava.getAccName());
+                blanc.setAccType(ava.getAccType());
+                blanc.setCurrency(ava.getCurrency());
+                blanc.setCurrencyName(ava.getCurrencyName());
+                blanc.setGroupCode(ava.getGroupCode());
+                blanc.setGroupName(ava.getGroupName());
+                blanc.setInOutType(ava.getInOutType());
+                blanc.setBankName(ava.getBankName());
+                blanc.setOccurDay(b.getBalanceDate());
+                bal = b.getRealBalance();
+                try {
+                    dcmbal = new BigDecimal(bal);
+                } catch (NumberFormatException e) {
+                    blanc.setBalance(null);
+                    blanc.setDirectMsg("值[" + bal + "]不能转换为数值!");
+                    break;
+                }
+
+                if ("D".equals(ava.getClosingFlag())) {
+                    dcmbal = new BigDecimal("0").subtract(dcmbal);
+                }
+
+                blanc.setBalance(dcmbal);
+                accBalances.add(blanc);
+            }
+        }
+    }
+
+    /**
+     * 设置直联余额值
+     *
+     * @param accBalances
+     * @param balances
+     * @param avaAccounts
+     */
+    private void setDirectBalance(List<AccBalance> accBalances,
+                                  List<Balance> balances, List<AvaAccount> avaAccounts, String ftFlag) {
+        String bal = StringUtils.EMPTY;
+        BigDecimal dcmbal = null;
+        String accNo = StringUtils.EMPTY;
+        String cryCode = StringUtils.EMPTY;
+        boolean isFind = false;
+        AccBalance blanc = null;
+        for (AvaAccount ava : avaAccounts) {
+            blanc = new AccBalance();
+            blanc.setAccNo(ava.getAccNo());
+            blanc.setAccName(ava.getAccName());
+            blanc.setAccType(ava.getAccType());
+            blanc.setCurrency(ava.getCurrency());
+            blanc.setCurrencyName(ava.getCurrencyName());
+            blanc.setGroupCode(ava.getGroupCode());
+            blanc.setGroupName(ava.getGroupName());
+            blanc.setInOutType(ava.getInOutType());
+            blanc.setBankName(ava.getBankName());
+            blanc.setFtFlag(ftFlag); //FT 账户
+
+            accNo = ava.getAccNo();
+            cryCode = this.getCryCode(ava.getCurrency());
+            isFind = false;
+            for (Balance balance : balances) {
+                if (ACCTYPE_FT_1.equals(ftFlag)) {
+                    if (!(accNo.equals(balance.getAccountNo()) && cryCode.equals(balance.getCurrency()))) {
+                        continue;
+                    }
+                } else {
+                    if (!accNo.equals(balance.getAccountNo())) {
+                        continue;
+                    }
+                }
+                isFind = true;
+                if ("9".equals(balance.getRetCode())) {
+                    blanc.setBalance(null);
+                    blanc.setDirectMsg("直联失败:错误信息[" + balance.getRetMsg() + "]");
+                    break;
+                }
+                bal = balance.getRealBalance();
+                if (StringUtils.isBlank(bal)) {
+                    blanc.setBalance(null);
+                    blanc.setDirectMsg("直联失败:银企通返回了空的余额值!");
+                    break;
+                }
+                try {
+                    dcmbal = new BigDecimal(bal);
+                } catch (NumberFormatException e) {
+                    blanc.setBalance(null);
+                    blanc.setDirectMsg("值[" + bal + "]不能转换为数值!");
+                    break;
+                }
+
+                if ("D".equals(ava.getClosingFlag())) {
+                    dcmbal = new BigDecimal("0").subtract(dcmbal);
+                }
+
+                blanc.setBalDt(balance.getReserved1());
+                blanc.setBalance(dcmbal);
+                break;
+            }
+            if (!isFind) {
+                blanc.setBalance(null);
+                blanc.setDirectMsg("直联失败:银企通未返回该账户的余额值!");
+            }
+            accBalances.add(blanc);
+        }
+    }
+
+    /**
+     * 查询外部户余额
+     *
+     * @param outer
+     * @return
+     */
+    public List<AccBalance> queryOuter(List<AvaAccount> outer) {
+        List<Balance> balances = new ArrayList<Balance>();
+        List<AccBalance> rows = new ArrayList<AccBalance>();
+        EBancClient client = new EBancClient(hostZh, Integer.parseInt(portZh));
+        BalanceResult balResult = null;
+        Result result = null;
+        Map<String, List<AvaAccount>> groups = groupByBank(outer);
+        if (groups == null || groups.size() == 0) {
+            throw new PlatException("按银行分组失败!");
+        }
+        List<AvaAccount> avaAccounts = null;
+        List<Account> accounts = null;
+        for (Map.Entry<String, List<AvaAccount>> entry : groups.entrySet()) {
+            accounts = new ArrayList<Account>(20);
+            avaAccounts = entry.getValue();
+
+            accounts = buildDirectAccount(avaAccounts);
+            balResult = client.queryBalances(accounts);
+            if (balResult == null) {
+                setDirectMsg(rows, avaAccounts, "直联失败:银企通返回了空值!");
+                continue;
+            }
+            result = balResult.getResult();
+            if (result.getStatus() != 0) {
+                setDirectMsg(rows, avaAccounts, "直联失败:错误代码[" + result.getRetCode()
+                        + "],错误信息[" + result.getRetMsg() + "]");
+                continue;
+            }
+            balances = balResult.getBalances();
+            if (CollectionUtils.isEmpty(balances)) {
+                setDirectMsg(rows, avaAccounts, "直联失败:银企通未返回余额结果集!");
+                continue;
+            }
+            setDirectBalance(rows, balances, avaAccounts, ACCTYPE_FT_0);
+        }
+        return rows;
+    }
+
+    /**
+     * 查询单日余额
+     *
+     * @param inInfo
+     * @return
+     */
+    @SuppressWarnings("unchecked")
+    public EiInfo queryToday(EiInfo inInfo) {
+        Map<String, String> params = inInfo.getRow("inqu_today", 0);
+        params.put("operate", "doToday");
+        List<AccBalance> rows = queryList(params, 0, 0);
+        EiInfo outInfo = new EiInfo();
+        EiBlock block = outInfo.addBlock(EiConstant.resultBlock);
+        block.set(EiConstant.isCountFlag, true);
+        block.setBlockMeta(new AccBalance().eiMetadata);
+        block.setRows(rows);
+        outInfo.setStatus(0);
+        outInfo.setMsg("成功完成!");
+        return outInfo;
+    }
+
+    /**
+     * 查询可用账户余额
+     *
+     * @param params
+     * @return
+     */
+    @SuppressWarnings("unchecked")
+    private List<AccBalance> queryList(Map<String, String> params, int offset, int limit) {
+        List<AccBalance> rows = new ArrayList<AccBalance>();
+        String ftFlag = params.get("ftFlag");
+        if ("doToday".equals(params.get("operate"))) {
+            String bankNo = params.get("bankNo");
+            if (StringUtils.isNotBlank(bankNo)) {
+                if (BANKNO_FCB.equals(bankNo)) {
+                    params.put("accType", ACCTYPE_INNER);
+                    params.put("bankNo", null);
+                } else {
+                    params.put("accType", ACCTYPE_OUTER);
+                }
+            }
+            params.put("userId", UserUtil.getUserID());
+            List<AvaAccount> accounts = new ArrayList<AvaAccount>();
+            List<AvaAccount> ftAccs = new ArrayList<AvaAccount>();
+            if (ACCTYPE_FT_0.equals(ftFlag)) {
+                // 查询当前用户可用账户
+                accounts = dao.query("NBAQ010.queryAvaAccounts", params, 0, -999999);
+            } else if (ACCTYPE_FT_1.equals(ftFlag)) {
+                // 查询当前用户 外汇账户列表
+                ftAccs = dao.query("NBAQ0101.queryAvaAccounts", params, 0, -999999);
+            } else {
+                accounts = dao.query("NBAQ010.queryAvaAccounts", params, 0, -999999);
+                ftAccs = dao.query("NBAQ0101.queryAvaAccounts", params, 0, -999999);
+            }
+            if (CollectionUtils.isEmpty(accounts) && CollectionUtils.isEmpty(ftAccs)) {
+                return rows;
+            }
+            //区分内部户和外部户
+            List<AvaAccount> inner = new ArrayList<AvaAccount>();
+            List<AvaAccount> outer = new ArrayList<AvaAccount>();
+            for (AvaAccount account : accounts) {
+                if (ACCTYPE_INNER.equals(account.getAccType())) {
+                    inner.add(account);
+                } else if (ACCTYPE_OUTER.equals(account.getAccType())) {
+                    outer.add(account);
+                }
+            }
+            //查询内部户余额
+            if (inner.size() > 0) {
+                rows = dao.query("NBAQ010.queryBalance", params, 0, -999999);
+            }
+            //查询外部户余额
+            if (outer.size() > 0) {
+                List<AccBalance> outList = queryOuter(outer);
+                rows.addAll(outList);
+            }
+            //查询外汇户余额
+            if (CollectionUtils.isNotEmpty(ftAccs)) {
+                List<AccBalance> ftList = queryFtAccBal(ftAccs);
+                rows.addAll(ftList);
+            }
+            //当日余额按币种分组小计
+            groupCount(rows);
+
+        } else {
+            if (ACCTYPE_FT_1.equals(ftFlag)) {
+                rows = queryFtAccHisBal(params, offset, limit);
+            } else {
+                if (ACCTYPE_OUTER.equals(params.get("accType"))) {
+                    rows = dao.query("NBAQ010.queryOuterHistory", params, 0, -999999);
+                } else {
+                    rows = dao.query("NBAQ010.queryInnerHistory", params, 0, -999999);
+                }
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * 查询外汇账户准实时余额
+     *
+     * @param ftAccs
+     * @return
+     */
+    private List<AccBalance> queryFtAccBal(List<AvaAccount> ftAccs) {
+        List<AccBalance> rows = new ArrayList<AccBalance>();
+        EBancClient client = new EBancClient(hostZh, Integer.parseInt(portZh));
+        BalanceResult balResult = null;
+        Result result = null;
+        List<Balance> balances = null;
+        List<Account> accounts = buildDirectAccount(ftAccs);
+        //设置外汇行号
+        setAccBankNo(accounts);
+        balResult = client.queryBalances(accounts);
+        if (balResult == null) {
+            setDirectMsg(rows, ftAccs, "直联失败:银企通返回了空值!");
+            return rows;
+        }
+        result = balResult.getResult();
+        if (result.getStatus() != 0) {
+            setDirectMsg(rows, ftAccs, "直联失败:错误代码[" + result.getRetCode()
+                    + "],错误信息[" + result.getRetMsg() + "]");
+            return rows;
+        }
+        balances = balResult.getBalances();
+        if (CollectionUtils.isEmpty(balances)) {
+            setDirectMsg(rows, ftAccs, "直联失败:银企通未返回余额结果集!");
+            return rows;
+        }
+        setDirectBalance(rows, balances, ftAccs, ACCTYPE_FT_1);
+        return rows;
+    }
+
+    //设置外汇行号
+    private void setAccBankNo(List<Account> acc) {
+        for (Account a : acc) {
+            a.setBankNo(bakSwiftZh);
+            a.setCurrency(a.getReserved4());
+        }
+    }
+
+    /**
+     * 查询外汇账户历史余额
+     *
+     * @param ftAccs
+     * @return
+     */
+    @SuppressWarnings("unchecked")
+    private List<AccBalance> queryFtAccHisBal(Map<String, String> params, int offset, int limit) {
+
+        List<AccBalance> rows = new ArrayList<AccBalance>();
+        EBancClient client = new EBancClient(hostZh, Integer.parseInt(portZh));
+        String accNo = params.get("accNo").toString();
+        String beginDate = params.get("beginDate").toString();
+        String endDate = params.get("endDate").toString();
+        //查询外汇账户信息
+        List<AvaAccount> accs = dao.query("NBAQ0101.queryAccInfo", params);
+        if (CollectionUtils.isEmpty(accs)) {
+            throw new PlatException("未检索到[" + accNo + "]账户信息");
+        }
+        AvaAccount ava = accs.get(0);
+        Account acc = new Account();
+        acc.setAccountNo(accNo);
+        acc.setBankNo(bakSwiftZh);
+        acc.setCurrency(ava.getIsoCurrency());
+        acc.setReserved1(beginDate);
+        acc.setReserved2(endDate);
+        Result result = null;
+        List<Balance> balances = null;
+        BalanceResult balResult = client.queryHistoryBalance(acc, beginDate, endDate, offset, limit);
+        if (balResult == null) {
+            throw new PlatException("直联失败:银企通返回了空值!");
+        }
+        result = balResult.getResult();
+        if (result.getStatus() != 0) {
+            throw new PlatException("直联失败:错误代码[" + result.getRetCode()
+                    + "],错误信息[" + result.getRetMsg() + "]");
+        }
+        balances = balResult.getBalances();
+        if (CollectionUtils.isEmpty(balances)) {
+            throw new PlatException("直联失败:银企通未返回余额结果集!");
+        }
+        setDirectBalance(rows, balances, ava);
+
+        return rows;
+    }
+
+    /**
+     * 根据币种分组统计
+     *
+     * @param rows
+     */
+    private void groupCount(List<AccBalance> rows) {
+        //当日明细分组统计
+        Map<String, List<AccBalance>> gcrybal = new LinkedHashMap<String, List<AccBalance>>();
+        for (AccBalance bal : rows) {
+            if (gcrybal.containsKey(bal.getCurrency())) {
+                List<AccBalance> bals = gcrybal.get(bal.getCurrency());
+                bals.add(bal);
+            } else {
+                List<AccBalance> bals = new ArrayList<AccBalance>();
+                bals.add(bal);
+                gcrybal.put(bal.getCurrency(), bals);
+            }
+        }
+        rows.clear(); //清空
+        for (Map.Entry<String, List<AccBalance>> entry : gcrybal.entrySet()) {
+            List<AccBalance> bals = entry.getValue();
+            int count = 0;
+            BigDecimal total = new BigDecimal("0");
+            for (AccBalance bal : bals) {
+                count++;
+                rows.add(bal);
+                total = total.add(bal.getBalance() == null ? new BigDecimal("0") : bal.getBalance());
+            }
+            AccBalance page = new AccBalance();
+            page.setAccName(getCnyName(entry.getKey()) + " 总笔数：" + count);
+            page.setInOutType(getCnyName(entry.getKey()) + " 总金额：");
+            page.setBalance(total);
+            rows.add(page);
+        }
+    }
+
+    /**
+     * 查询历史余额
+     *
+     * @param inInfo
+     * @return
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public EiInfo queryHistory(EiInfo inInfo) {
+        EiInfo outInfo = new EiInfo();
+        String accType = inInfo.getString("inqu_history-0-accType");
+        String ftFlag = inInfo.getString("inqu_history-0-ftFlag");
+        AccBalance balance = new AccBalance();
+        if (ACCTYPE_FT_1.equals(ftFlag)) {
+            int offset = inInfo.getInt("result-offset");
+            int limit = inInfo.getInt("result-limit");
+            if (limit <= 0) limit = EiConstant.defaultLimit;
+            if (offset <= 0) offset = EiConstant.defaultOffset;
+
+            Map<String, String> params = inInfo.getRow("inqu_history", 0);
+            List rows = queryFtAccHisBal(params, offset, limit);
+            EiBlock block = outInfo.addBlock(EiConstant.resultBlock);
+            block.set(EiConstant.isCountFlag, true);
+            block.setBlockMeta(balance.eiMetadata);
+            block.setRows(rows);
+            outInfo.setStatus(0);
+            outInfo.setMsg("成功完成!");
+        } else {
+            String qrysql = "NBAQ010.queryInnerHistory";
+            if (ACCTYPE_OUTER.equals(accType)) {
+                qrysql = "NBAQ010.queryOuterHistory";
+            }
+            outInfo = super.query(inInfo, qrysql, balance, false,
+                    balance.eiMetadata, "inqu_history", null, null);
+        }
+        return outInfo;
+    }
+
+    /**
+     * 查询可用账户
+     *
+     * @param inInfo
+     * @return
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public EiInfo queryAccount(EiInfo inInfo) {
+        String operate = inInfo.getString("operate");
+        if ("today".equals(operate)) {
+            String bankNo = inInfo.getString("inqu_today-0-bankNo");
+            String ccyCode = inInfo.getString("inqu_today-0-ccyCode");
+            if (StringUtils.isNotBlank(bankNo)) {
+                if (BANKNO_FCB.equals(bankNo)) {
+                    inInfo.set("inqu_credit-0-bankNo", null);
+                    inInfo.set("inqu_credit-0-accType", ACCTYPE_INNER);
+                } else {
+                    inInfo.set("inqu_credit-0-bankNo", bankNo);
+                    inInfo.set("inqu_credit-0-accType", ACCTYPE_OUTER);
+                }
+            }
+            if (StringUtils.isNotBlank(ccyCode)) {
+                inInfo.set("inqu_credit-0-ccyCode", ccyCode);
+            }
+        }
+        inInfo.set("inqu_credit-0-userId", UserUtil.getUserID());
+        inInfo.set("inqu_credit-0-opPower", "1");
+        PopupInfo popup = new PopupInfo();
+        EiInfo outInfo = super.query(inInfo, "NBAQ0101.queryCreditAccount",
+                popup, false, popup.eiMetadata, "inqu_credit", null, null);
+        List rows = outInfo.getBlock(EiConstant.resultBlock).getRows();
+        rows.add(0, popup.toMap());
+        return outInfo;
+    }
+
+    /**
+     * 下载明细
+     *
+     * @param inInfo
+     * @return
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public EiInfo download(EiInfo inInfo) {
+        String operate = inInfo.getString("operate");
+        if (StringUtils.isBlank(operate)) {
+            throw new PlatException("未找到操作信息!");
+        }
+        Map params = null;
+        if ("doToday".equals(operate)) {
+            params = inInfo.getRow("inqu_today", 0);
+        } else if ("doHistory".equals(operate)) {
+            params = inInfo.getRow("inqu_history", 0);
+        } else {
+            throw new PlatException("操作信息不正确!");
+        }
+        params.put("operate", operate);
+        int offset = inInfo.getInt("result-offset");
+        int limit = inInfo.getInt("result-limit");
+        if (limit <= 0) limit = EiConstant.defaultLimit;
+        if (offset <= 0) offset = EiConstant.defaultOffset;
+        List<AccBalance> records = queryList(params, offset, limit);
+        if (CollectionUtils.isEmpty(records)) {
+            throw new PlatException("在当前时间范围内没有明细!");
+        }
+        try {
+            String format = inInfo.getString("format");
+            String fileName = "";
+            if ("excel".equals(format)) {
+                fileName = buildExcel(params, records);
+            } else if ("text".equals(format)) {
+                fileName = buildText(params, records);
+            } else {
+                throw new PlatException("格式信息不正确!");
+            }
+            inInfo.set("fileName", fileName);
+            inInfo.setStatus(EiConstant.STATUS_SUCCESS);
+            inInfo.setMsg("生成文件成功!");
+        } catch (Exception e) {
+            logger.error("生成下载文件", e);
+            inInfo.setStatus(-1);
+            inInfo.setMsg(getAbbrErrMsg(e));
+        }
+        return inInfo;
+    }
+
+    /**
+     * 构建TEXT文件
+     *
+     * @throws Exception
+     */
+    @SuppressWarnings("rawtypes")
+    public String buildText(Map params, List<AccBalance> records) throws Exception {
+        File file = createFile(params, ".txt");
+        OutputStream out = new FileOutputStream(file);
+        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out, ENCODING));
+        StringBuilder buff = new StringBuilder(100);
+        if ("doToday".equals(params.get("operate"))) {
+            buildTodayText(buff, records);
+        } else {
+            buildHistoryText(buff, records);
+        }
+        writer.write(buff.toString());
+        writer.flush();
+        writer.close();
+        out.close();
+        buff = null;
+        return file.getName();
+    }
+
+    private void buildTodayText(StringBuilder buff,
+                                List<AccBalance> records) throws IOException {
+        buff.append("分组名,帐号,户名,开户行名称,余额,币种;");
+        buff.append(CRLF);
+        for (AccBalance balance : records) {
+            buff.append(getNull2Str(balance.getGroupName()));
+            buff.append(COMMA);
+            buff.append(balance.getAccNo());
+            buff.append(COMMA);
+            buff.append(balance.getAccName());
+            buff.append(COMMA);
+            buff.append(balance.getBankName());
+            buff.append(COMMA);
+            buff.append(getFormatString(balance.getBalance()));
+            buff.append(balance.getCurrencyName());
+            buff.append(SMICN);
+            buff.append(CRLF);
+        }
+    }
+
+    /**
+     * 构建历史明细
+     *
+     * @param records
+     * @return
+     * @throws IOException
+     */
+    private void buildHistoryText(StringBuilder buff,
+                                  List<AccBalance> records) throws IOException {
+        buff.append("分组名,帐号,户名,日期,余额;");
+        buff.append(CRLF);
+        for (AccBalance balance : records) {
+            buff.append(getNull2Str(balance.getGroupName()));
+            buff.append(COMMA);
+            buff.append(balance.getAccNo());
+            buff.append(COMMA);
+            buff.append(balance.getAccName());
+            buff.append(COMMA);
+            buff.append(balance.getOccurDay());
+            buff.append(COMMA);
+            buff.append(getFormatString(balance.getBalance()));
+            buff.append(SMICN);
+            buff.append(CRLF);
+        }
+    }
+
+    private String getNull2Str(String str) {
+        if (str == null || str.length() == 0) {
+            return " ";
+        }
+        return str;
+    }
+
+    /**
+     * 构建文件名
+     *
+     * @param accNo
+     * @param year
+     * @param month
+     * @param suffix
+     * @return
+     */
+    @SuppressWarnings("rawtypes")
+    private String buildFileName(Map params, String suffix) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Balance-");
+        if ("doToday".equals(params.get("operate"))) {
+            sb.append(DateUtil.getCurDate("YYYY-MM-DD"));
+        } else {
+            sb.append(params.get("beginDate"));
+            sb.append("_");
+            sb.append(params.get("endDate"));
+        }
+        sb.append("-" + RandomUtils.nextLong());
+        sb.append(suffix);
+        return (sb.toString());
+    }
+
+    /**
+     * 创建文件
+     *
+     * @param accNo
+     * @param year
+     * @param month
+     * @param suffix
+     * @return
+     * @throws IOException
+     */
+    @SuppressWarnings("rawtypes")
+    private File createFile(Map params, String suffix) throws IOException {
+        String path = I18nMessages.getText("download.nb.file");
+        String fileName = buildFileName(params, suffix);
+        File file = new File(path + fileName);
+        if (!file.getParentFile().exists())
+            file.getParentFile().mkdirs();
+        if (file.exists()) file.delete();
+        if (!file.createNewFile()) {
+            throw new IOException("创建文件失败!");
+        }
+        return file;
+    }
+
+    /**
+     * 构建Excel文件
+     *
+     * @param outInfo
+     * @throws IOException
+     * @throws BiffException
+     * @throws WriteException
+     * @throws Exception
+     */
+    @SuppressWarnings("rawtypes")
+    public String buildExcel(Map params, List<AccBalance> records)
+            throws BiffException, IOException, WriteException {
+        WritableFont wfc0 = new WritableFont(WritableFont.ARIAL, 10,
+                WritableFont.BOLD, false, UnderlineStyle.NO_UNDERLINE,
+                jxl.format.Colour.BLACK);
+        WritableCellFormat wcfFC0 = new WritableCellFormat(wfc0);
+        wcfFC0.setAlignment(jxl.format.Alignment.CENTRE);
+
+        WritableFont wfc1 = new WritableFont(WritableFont.ARIAL, 10,
+                WritableFont.NO_BOLD, false, UnderlineStyle.NO_UNDERLINE,
+                jxl.format.Colour.BLACK);
+        WritableCellFormat wcfFC1 = new WritableCellFormat(wfc1);
+        wcfFC1.setAlignment(jxl.format.Alignment.CENTRE);
+
+        WritableCellFormat wcfFC3 = new WritableCellFormat(wfc1);
+        wcfFC3.setAlignment(jxl.format.Alignment.LEFT);
+
+        NumberFormat fivedps = new NumberFormat("#,###,##0.00");
+        WritableFont wfc2 = new WritableFont(WritableFont.ARIAL, 10,
+                WritableFont.NO_BOLD, false, UnderlineStyle.NO_UNDERLINE,
+                jxl.format.Colour.BLACK);
+        WritableCellFormat wcfFC2 = new WritableCellFormat(wfc2, fivedps);
+        wcfFC2.setAlignment(jxl.format.Alignment.RIGHT);
+        String name = "";
+        if ("doToday".equals(params.get("operate"))) {
+            name = buildTodayExcel(params, records, wcfFC0, wcfFC1, wcfFC2, wcfFC3);
+        } else {
+            name = buildHistoryExcel(params, records, wcfFC0, wcfFC1, wcfFC2, wcfFC3);
+        }
+        return name;
+    }
+
+    @SuppressWarnings("rawtypes")
+    private String buildTodayExcel(Map params, List<AccBalance> records,
+                                   WritableCellFormat wcfFC0, WritableCellFormat wcfFC1,
+                                   WritableCellFormat wcfFC2, WritableCellFormat wcfFC3) throws IOException, WriteException,
+            RowsExceededException {
+        File file = createFile(params, ".xls");
+        WritableWorkbook book = Workbook.createWorkbook(file);
+        WritableSheet sheet = book.createSheet("Balance", 0);
+        sheet.setColumnView(0, 20);
+        sheet.setColumnView(1, 30);
+        sheet.setColumnView(2, 40);
+        sheet.setColumnView(3, 40);
+        sheet.setColumnView(4, 30);
+        sheet.setColumnView(5, 40);
+
+        sheet.addCell(new Label(0, 0, "分组名", wcfFC0));
+        sheet.addCell(new Label(1, 0, "帐号", wcfFC0));
+        sheet.addCell(new Label(2, 0, "户名", wcfFC0));
+        sheet.addCell(new Label(3, 0, "开户行名称", wcfFC0));
+        sheet.addCell(new Label(4, 0, "余额", wcfFC0));
+        sheet.addCell(new Label(5, 0, "币种", wcfFC0));
+
+        int index = 0;
+        for (AccBalance balance : records) {
+            index++;
+            addLabelCell(0, index, balance.getGroupName(), sheet, wcfFC3);
+            addLabelCell(1, index, balance.getAccNo(), sheet, wcfFC3);
+            addLabelCell(2, index, balance.getAccName(), sheet, wcfFC3);
+            addLabelCell(3, index, balance.getBankName(), sheet, wcfFC3);
+            addDoubleCell(4, index, balance.getBalance(), sheet, wcfFC2);
+            addLabelCell(5, index, balance.getCurrencyName(), sheet, wcfFC3);
+        }
+        book.write();
+        book.close();
+        return file.getName();
+    }
+
+    @SuppressWarnings("rawtypes")
+    private String buildHistoryExcel(Map params, List<AccBalance> records,
+                                     WritableCellFormat wcfFC0, WritableCellFormat wcfFC1,
+                                     WritableCellFormat wcfFC2, WritableCellFormat wcfFC3) throws IOException, WriteException,
+            RowsExceededException {
+        File file = createFile(params, ".xls");
+        WritableWorkbook book = Workbook.createWorkbook(file);
+        WritableSheet sheet = book.createSheet("Balance", 0);
+        sheet.setColumnView(0, 20);
+        sheet.setColumnView(1, 30);
+        sheet.setColumnView(2, 40);
+        sheet.setColumnView(3, 20);
+        sheet.setColumnView(4, 30);
+
+        sheet.addCell(new Label(0, 0, "分组名", wcfFC0));
+        sheet.addCell(new Label(1, 0, "帐号", wcfFC0));
+        sheet.addCell(new Label(2, 0, "户名", wcfFC0));
+        sheet.addCell(new Label(3, 0, "日期", wcfFC0));
+        sheet.addCell(new Label(4, 0, "余额", wcfFC0));
+
+        int index = 0;
+        for (AccBalance balance : records) {
+            index++;
+            addLabelCell(0, index, balance.getGroupName(), sheet, wcfFC3);
+            addLabelCell(1, index, balance.getAccNo(), sheet, wcfFC3);
+            addLabelCell(2, index, balance.getAccName(), sheet, wcfFC3);
+            addLabelCell(3, index, balance.getOccurDay(), sheet, wcfFC3);
+            addDoubleCell(4, index, balance.getBalance(), sheet, wcfFC2);
+        }
+        book.write();
+        book.close();
+        return file.getName();
+    }
+
+    private String getFormatString(Object value) throws NumberFormatException {
+        double number = 0.00;
+        if (value != null) {
+            number = Double.parseDouble(value.toString());
+        }
+        try {
+            return new DecimalFormat("#0.00").format(number);
+        } catch (Exception e) {
+            throw new NumberFormatException("格式化[" + number + "]失败!");
+        }
+    }
+
+    private void addLabelCell(int c, int r, Object cont, WritableSheet sheet,
+                              WritableCellFormat font) throws RowsExceededException,
+            WriteException {
+        sheet.addCell(new Label(c, r, (String) cont, font));
+    }
+
+    private void addDoubleCell(int c, int r, Object cont, WritableSheet sheet,
+                               WritableCellFormat font) throws RowsExceededException,
+            WriteException {
+        double number = 0.00;
+        if (cont != null) {
+            number = Double.parseDouble(cont.toString());
+        }
+        sheet.addCell(new jxl.write.Number(c, r, number, font));
+    }
+
+    /**
+     * 户名的下拉选项, 所有账户
+     *
+     * @param in
+     * @return result
+     */
+    public EiInfo getCsNameDropList(EiInfo in) {
+        EiInfo result = new EiInfo();
+        // reuslt may more than 1000 records, recursive to get all records
+        Map<String, String> params = new HashMap<String, String>();
+        List<?> resultList = dao.query("NBAQ010.getCsNameDropList", params, 0,
+                -999999);
+
+        EiBlock block = new EiBlock("csIdBlock");
+
+        EiBlockMeta metas = new EiBlockMeta();
+        EiColumn eiColumn = new EiColumn("id");
+        eiColumn.setFieldLength(255);
+        eiColumn.setDescName("客户编号");
+        metas.addMeta(eiColumn);
+
+        eiColumn = new EiColumn("name");
+        eiColumn.setFieldLength(255);
+        eiColumn.setDescName("帐户名称");
+        metas.addMeta(eiColumn);
+
+        eiColumn = new EiColumn("info");
+        eiColumn.setFieldLength(255);
+        eiColumn.setDescName("info");
+        metas.addMeta(eiColumn);
+
+        block.setBlockMeta(metas);
+        block.setRows(resultList);
+        result.addBlock(block);
+
+        return result;
+    }
+
+    /**
+     * 币种
+     *
+     * @param ccyCode
+     * @return
+     */
+    @SuppressWarnings("unchecked")
+    private String getCnyName(String ccyCode) {
+        String cnyName = "";
+        try {
+            List<Map<String, String>> ccyNameList = dao.query("NBAQ0101.queryCcyName", ccyCode);
+            if (ccyNameList != null && ccyNameList.size() == 1) {
+                cnyName = ccyNameList.get(0).get("currencyName");
+            }
+        } catch (Exception e) {
+            cnyName = "未知币种";
+        }
+        return cnyName;
+    }
+
+    /**
+     * 获取国际币种
+     *
+     * @param ccyCode
+     * @return
+     */
+    @SuppressWarnings("unchecked")
+    private String getCryCode(String ccyCode) {
+        String cryCode = "";
+        try {
+            List<Map<String, String>> ccyNameList = dao.query("NBAQ0101.queryCcyName", ccyCode);
+            if (ccyNameList != null && ccyNameList.size() == 1) {
+                cryCode = ccyNameList.get(0).get("isoCryCode");
+            }
+        } catch (Exception e) {
+            cryCode = "";
+        }
+        return cryCode;
+    }
+
+    public EiInfo getCnyNameByCode(EiInfo inInfo) {
+        EiInfo outInfo = new EiInfo();
+        try {
+            String ccyCode = inInfo.getString("ccyCode");
+            outInfo.set("cnyName", this.getCnyName(ccyCode));
+            outInfo.setStatus(EiConstant.STATUS_SUCCESS);
+        } catch (Exception e) {
+            outInfo.setStatus(EiConstant.STATUS_FAILURE);
+            logger.error("获取币种失败" + e.getMessage(), e);
+        }
+        return outInfo;
+    }
+}
